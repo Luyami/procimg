@@ -1,0 +1,349 @@
+#version 430 core
+
+layout(local_size_x = 16, local_size_y = 16) in;
+
+struct FilterSettings {
+    uint option;
+
+    int brightness;
+    float threshold;
+    float gamma;
+
+    float piecewiseR1;
+    float piecewiseS1;
+    float piecewiseR2;
+    float piecewiseS2;
+
+    float scale_factor_x;
+    float scale_factor_y;
+
+    uint interpolation;
+
+    float rotation_angle;
+    float pivot_x;
+    float pivot_y;
+    float canvas_offset_x;
+    float canvas_offset_y;
+
+    int kernelSize;
+
+    uint grayMethod;
+
+    float hueShift;
+    float saturationScale;
+    float intensityScale;
+
+    float cyanRed;
+    float magentaGreen;
+    float yellowBlue;
+
+    vec3 keyColor;
+    float chromaDistance;
+    float chromaSmoothness;
+};
+
+uniform bool hasSelection;
+uniform vec2 tlCorner;
+uniform vec2 brCorner;
+
+layout(rgba8, binding = 0) uniform image2D baseImage;
+layout(rgba8, binding = 1) uniform image2D prevImage;
+layout(rgba8, binding = 2) uniform image2D currImage;
+layout(rgba8, binding = 3) uniform image2D bgChromaImage;
+
+#define PI 3.14159265358979323846
+
+layout(std140, binding = 0) uniform Settings{
+    FilterSettings settings;
+};
+
+layout(std430, binding = 1) buffer MatrixBuffer{
+    float kernel[];
+};
+uniform int kernelSize;
+
+vec3 rgb2hsi(vec3 c) {
+    float r = clamp(c.r, 0.0, 1.0);
+    float g = clamp(c.g, 0.0, 1.0);
+    float b = clamp(c.b, 0.0, 1.0);
+
+    float sumRGB = r + g + b;
+    float i = sumRGB / 3.0;
+
+    if (i <= 1e-6 || sumRGB <= 1e-6) {
+        return vec3(0.0);
+    }
+
+    float minRGB = min(r, min(g, b));
+    float s = clamp(1.0 - (3.0 / sumRGB) * minRGB, 0.0, 1.0);
+
+    if (s <= 1e-6) {
+        return vec3(0.0, 0.0, i);
+    }
+
+    float num = 0.5 * ((r - g) + (r - b));
+    float den = sqrt((r - g) * (r - g) + (r - b) * (g - b));
+
+    if (den <= 1e-6) {
+        return vec3(0.0, s, i);
+    }
+
+    float theta = acos(clamp(num / den, -1.0, 1.0));
+    float h = (b > g) ? (2.0 * PI - theta) : theta;
+
+    return vec3(degrees(h), s, i);
+}
+
+vec3 hsi2rgb(vec3 hsi) {
+    float h = mod(hsi.x, 360.0);
+    if (h < 0.0) h += 360.0;
+
+    float s = clamp(hsi.y, 0.0, 1.0);
+    float i = clamp(hsi.z, 0.0, 1.0);
+
+    if (s <= 1e-6) {
+        return vec3(i);
+    }
+
+    float r = 0.0, g = 0.0, b = 0.0;
+    float hRad = radians(h);
+
+    if (h < 120.0) {
+        b = i * (1.0 - s);
+        float denom = cos(radians(60.0) - hRad);
+        denom = abs(denom) < 1e-6 ? 1e-6 : denom;
+        r = i * (1.0 + (s * cos(hRad)) / denom);
+        g = 3.0 * i - (r + b);
+    } else if (h < 240.0) {
+        hRad -= radians(120.0);
+        r = i * (1.0 - s);
+        float denom = cos(radians(60.0) - hRad);
+        denom = abs(denom) < 1e-6 ? 1e-6 : denom;
+        g = i * (1.0 + (s * cos(hRad)) / denom);
+        b = 3.0 * i - (r + g);
+    } else {
+        hRad -= radians(240.0);
+        g = i * (1.0 - s);
+        float denom = cos(radians(60.0) - hRad);
+        denom = abs(denom) < 1e-6 ? 1e-6 : denom;
+        b = i * (1.0 + (s * cos(hRad)) / denom);
+        r = 3.0 * i - (g + b);
+    }
+
+    return clamp(vec3(r, g, b), 0.0, 1.0);
+}
+
+vec4 applyGrayscale(vec4 color, uint method) {
+    float gray;
+    if (method == 0u) {
+        gray = (color.r + color.g + color.b) / 3.0;
+    } else {
+        gray = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+    }
+    return vec4(vec3(gray), color.a);
+}
+
+vec4 applyHSIAdjust(vec4 color) {
+    vec3 hsi = rgb2hsi(color.rgb);
+
+    hsi.x += settings.hueShift;
+    hsi.y = clamp(hsi.y * settings.saturationScale, 0.0, 1.0);
+    hsi.z = clamp(hsi.z * settings.intensityScale, 0.0, 1.0);
+
+    return vec4(hsi2rgb(hsi), color.a);
+}
+
+vec4 applyColorBalance(vec4 color) {
+    vec3 rgb = color.rgb;
+    rgb.r += settings.cyanRed;       // Cyan (-) <-> Red (+)
+    rgb.g += settings.magentaGreen; // Magenta (-) <-> Green (+)
+    rgb.b += settings.yellowBlue;    // Yellow (-) <-> Blue (+)
+    return vec4(clamp(rgb, 0.0, 1.0), color.a);
+}
+
+vec4 applySepia(vec4 color) {
+    vec3 rgb = color.rgb;
+    vec3 sepia;
+    sepia.r = dot(rgb, vec3(0.393, 0.769, 0.189));
+    sepia.g = dot(rgb, vec3(0.349, 0.686, 0.168));
+    sepia.b = dot(rgb, vec3(0.272, 0.534, 0.131));
+    return vec4(clamp(sepia, 0.0, 1.0), color.a);
+}
+
+vec4 applyChromaKey(vec4 color, ivec2 pixel) {
+    float dist = distance(color.rgb, settings.keyColor);
+    ivec2 bgSize = imageSize(bgChromaImage);
+
+    vec4 bgColor = vec4(0.0, 0.0, 0.0, 0.0);    
+    if (bgSize.x > 0 && bgSize.y > 0) {
+        ivec2 bgPixel = ivec2(
+            clamp(pixel.x, 0, bgSize.x - 1),
+            clamp(pixel.y, 0, bgSize.y - 1)
+        );
+        bgColor = imageLoad(bgChromaImage, bgPixel);
+    }
+
+    float alpha = smoothstep(settings.chromaDistance, settings.chromaDistance + settings.chromaSmoothness, dist);
+    return mix(bgColor, color, alpha);
+}
+
+vec4 negative(vec4 color){
+    color.rgb = 1.0f - color.rgb;
+    return color;
+}
+
+vec4 brightness(vec4 color, int mag){
+    color.rgb = color.rgb + float(mag/255.0);
+    return color;
+}
+
+vec4 threshold(vec4 color, float threshold){
+    float gray = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+
+    if (gray >= threshold)
+        return vec4(1.0, 1.0, 1.0, color.a);
+    else
+        return vec4(0.0, 0.0, 0.0, color.a);
+}
+
+vec4 gammaCorrection(vec4 color, float gamma){
+    color.rgb = pow(color.rgb, vec3(gamma));
+    return color;
+}
+
+vec4 convolution(vec4 color, ivec2 curPixel){
+    ivec2 dims = imageSize(prevImage);
+
+    int width  = dims.x;
+    int height = dims.y;
+
+    vec4 acc = vec4(0.0);
+
+    int radius = kernelSize/2;
+
+    for (int row = 0; row < kernelSize; ++row){
+        for (int column = 0; column < kernelSize; ++column){
+            ivec2 p = ivec2(curPixel.x + column - radius, curPixel.y + row - radius);
+            p.x = clamp(p.x, 0, width - 1);
+            p.y = clamp(p.y, 0, height - 1);
+
+            acc = acc + imageLoad(prevImage, p) * kernel[row * kernelSize + column];
+        }
+    }
+
+    return vec4(acc.x, acc.y, acc.z, color.w);
+}
+
+vec4 sampleImage(ivec2 srcSize, vec2 src){
+    if (settings.interpolation == 0u){
+        ivec2 p = ivec2(floor(src));
+
+        if (p.x < 0 || p.y < 0 || p.x >= srcSize.x || p.y >= srcSize.y)
+            return vec4(0.0);
+
+        return imageLoad(prevImage, p);
+    }
+
+    int x0 = int(floor(src.x));
+    int y0 = int(floor(src.y));
+    int x1 = x0 + 1;
+    int y1 = y0 + 1;
+
+    if (src.x < -0.5 || src.y < -0.5 || src.x >= float(srcSize.x) + 0.5 || src.y >= float(srcSize.y) + 0.5) {
+        return vec4(0.0);
+    }
+
+    float fx = fract(src.x);
+    float fy = fract(src.y);
+
+    ivec2 p00 = clamp(ivec2(x0, y0), ivec2(0), srcSize - ivec2(1));
+    ivec2 p10 = clamp(ivec2(x1, y0), ivec2(0), srcSize - ivec2(1));
+    ivec2 p01 = clamp(ivec2(x0, y1), ivec2(0), srcSize - ivec2(1));
+    ivec2 p11 = clamp(ivec2(x1, y1), ivec2(0), srcSize - ivec2(1));
+
+    vec4 c00 = imageLoad(prevImage, p00);
+    vec4 c10 = imageLoad(prevImage, p10);
+    vec4 c01 = imageLoad(prevImage, p01);
+    vec4 c11 = imageLoad(prevImage, p11);
+
+    vec4 c0 = mix(c00, c10, fx);
+    vec4 c1 = mix(c01, c11, fx);
+    return mix(c0, c1, fy);
+}
+
+vec4 scale(ivec2 curPixel, float scale_x, float scale_y){
+    ivec2 srcSize = imageSize(prevImage);
+    vec2 src = vec2(float(curPixel.x) / scale_x, float(curPixel.y) / scale_y);
+    return sampleImage(srcSize, src);
+}
+
+vec4 rotate(ivec2 curPixel, float angleDeg, vec2 pivot){
+    ivec2 srcSize = imageSize(prevImage);
+    // Adicione o sinal de menos para girar no sentido Anti-Horário
+    float a = radians(-angleDeg); 
+    float c = cos(a);
+    float s = sin(a);
+
+    vec2 dst = vec2(curPixel) + vec2(0.5) - vec2(settings.canvas_offset_x, settings.canvas_offset_y);
+    vec2 d = dst - pivot;
+    
+    vec2 src = vec2(c * d.x + s * d.y, -s * d.x + c * d.y) + pivot;
+
+    return sampleImage(srcSize, src);
+}
+
+vec4 histogramEqualization(vec4 color, ivec2 pixel) {
+    float gray = dot(color.rgb, vec3(0.299, 0.587, 0.114));
+    
+    return color; 
+}
+
+float applyPiecewise(float v, float r1, float s1, float r2, float s2) {
+    if (v < r1) {
+        return (r1 > 0.0) ? (s1 / r1) * v : s1;
+    } else if (v < r2) {
+        return (r2 > r1) ? ((s2 - s1) / (r2 - r1)) * (v - r1) + s1 : s2;
+    } else {
+        return (r2 < 1.0) ? ((1.0 - s2) / (1.0 - r2)) * (v - r2) + s2 : 1.0;
+    }
+}
+
+vec4 piecewiseLinear(vec4 color, float r1, float s1, float r2, float s2) {
+    color.r = applyPiecewise(color.r, r1, s1, r2, s2);
+    color.g = applyPiecewise(color.g, r1, s1, r2, s2);
+    color.b = applyPiecewise(color.b, r1, s1, r2, s2);
+    
+    return vec4(clamp(color.rgb, 0.0, 1.0), color.a);
+}
+
+void main(){
+    ivec2 pixel = ivec2(gl_GlobalInvocationID.xy);
+    ivec2 canvasSize = imageSize(currImage);
+
+    if (pixel.x >= canvasSize.x || pixel.y >= canvasSize.y)
+        return;
+
+    if (hasSelection){
+        if (   pixel.x < tlCorner.x || pixel.x > brCorner.x ||
+               pixel.y < tlCorner.y || pixel.y > brCorner.y   ) return;
+    }
+
+    vec4 color = imageLoad(currImage, pixel);
+
+    if      (settings.option == 0) color.rgba = negative(color);
+    else if (settings.option == 1) color.rgba = brightness(color, settings.brightness);
+    else if (settings.option == 2) color.rgba = threshold(color, settings.threshold);
+    else if (settings.option == 3) color.rgba = gammaCorrection(color, settings.gamma);
+    else if (settings.option == 4) color.rgba = piecewiseLinear(color, settings.piecewiseR1, settings.piecewiseS1, settings.piecewiseR2, settings.piecewiseS2);
+    else if (settings.option == 5) color.rgba = convolution(color, pixel);
+    else if (settings.option == 6) color.rgba = scale(pixel, settings.scale_factor_x, settings.scale_factor_y);
+    else if (settings.option == 7) color.rgba = rotate(pixel, settings.rotation_angle, vec2(settings.pivot_x, settings.pivot_y));   
+    else if (settings.option == 9) color.rgba = histogramEqualization(color, pixel);
+    else if (settings.option == 10) color = applyGrayscale(color, settings.grayMethod);
+    else if (settings.option == 11) color = applyHSIAdjust(color);
+    else if (settings.option == 12) color = applyColorBalance(color);
+    else if (settings.option == 13) color = applySepia(color);
+    else if (settings.option == 14) color = applyChromaKey(color, pixel);
+
+    imageStore(currImage, pixel, color);
+}
